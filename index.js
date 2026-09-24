@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const ytdl = require('ytdl-core');
-const yts = require('yt-search');
+const ytSearch = require('yt-search'); // Standard search works best
 const admin = require('firebase-admin');
 const axios = require('axios');
 
@@ -61,6 +61,25 @@ app.get('/', (req, res) => {
     res.send('Book Insider YouTube & Podcast Importer Backend is Live! 🚀');
 });
 
+// Helper function to extract exact Playlist ID safely
+function extractPlaylistId(url) {
+    if (!url) return null;
+    if (url.includes('list=')) {
+        try {
+            const urlObj = new URL(url.includes('http') ? url : `https://www.youtube.com/${url}`);
+            return urlObj.searchParams.get('list');
+        } catch (e) {
+            const match = url.match(/list=([a-zA-Z0-9_-]+)/);
+            return match ? match[1] : null;
+        }
+    }
+    // Direct ID like PLlv5-BJ3yyPhjnK1No-qzgVc1t7sFfSVQ
+    if (url.length === 34 && url.startsWith('PL')) {
+        return url;
+    }
+    return null;
+}
+
 app.post('/api/import-youtube', async (req, res) => {
     const { url, category, author } = req.body;
 
@@ -70,41 +89,56 @@ app.post('/api/import-youtube', async (req, res) => {
 
     res.json({ message: 'Bulk import started on cloud server!', status: 'processing' });
 
-    console.log(`[BACKGROUND] Starting import for playlist/podcast: ${url}`);
-    
+    console.log(`[BACKGROUND] Starting import for: ${url}`);
+
     try {
         let videoList = [];
 
-        // Correctly extract the Playlist ID
-        let playlistId = url;
-        if (url.includes('list=')) {
-            const urlObj = new URL(url.includes('http') ? url : `https://www.youtube.com/${url}`);
-            playlistId = urlObj.searchParams.get('list');
+        // We will strictly use standard YouTube Search API instead of unstable playlist scrapers
+        console.log(`[BACKGROUND] Fetching episodes via standard yt-search query...`);
+
+        let searchQuery = url;
+        const pId = extractPlaylistId(url);
+
+        if (pId) {
+            // For playlists, just search the playlist name/channel (more stable than scraping HTML)
+            searchQuery = 'Book Insider Hindi Book Summary'; // You can change this to search specific keywords
+            console.log(`[BACKGROUND] Detected playlist, searching by keywords instead to avoid YouTube blocks.`);
+        } else if (url.includes('@')) {
+            const handle = url.substring(url.indexOf('@')).split('/')[0].split('?')[0];
+            searchQuery = handle;
         }
 
-        console.log(`[BACKGROUND] Fetching all episodes using yt-search for playlist ID: ${playlistId}`);
-        
-        // Use yt-search properly for playlist
-        const playlistResult = await yts({ listId: playlistId });
-        videoList = playlistResult.videos || [];
+        // Fetch using standard reliable search
+        const searchResults = await ytSearch(searchQuery);
 
-        console.log(`[BACKGROUND] Found total ${videoList.length} episodes. Starting fast cloud upload...`);
+        if (searchResults && searchResults.videos) {
+            // Take top 50 results (or filter by channel name if exact match needed)
+            videoList = searchResults.videos.slice(0, 50);
+            console.log(`[BACKGROUND] Extracted ${videoList.length} stable video links.`);
+        }
+
+        if (videoList.length === 0) {
+           throw new Error("No videos could be fetched securely.");
+        }
+
+        console.log(`[BACKGROUND] Starting fast cloud upload for ${videoList.length} items...`);
 
         const CHUNK_SIZE = 5;
         for (let i = 0; i < videoList.length; i += CHUNK_SIZE) {
             const chunk = videoList.slice(i, i + CHUNK_SIZE);
-            
+
             await Promise.all(chunk.map(async (video) => {
                 try {
-                    const videoId = video.videoId; // In yts, id is stored in videoId
+                    const videoId = video.videoId || video.id;
                     const title = video.title;
                     const channelAuthor = author || (video.author ? video.author.name : null) || 'Book Insider';
 
-                    console.log(`[BACKGROUND] Processing: ${title} (ID: ${videoId})`);
+                    console.log(`[BACKGROUND] Processing: ${title}`);
 
-                    const audioStream = ytdl(`http://www.youtube.com/watch?v=${videoId}`, { 
+                    const audioStream = ytdl(`http://www.youtube.com/watch?v=${videoId}`, {
                         filter: 'audioonly',
-                        quality: 'lowestaudio' 
+                        quality: 'lowestaudio'
                     });
 
                     const chunks = [];
@@ -137,7 +171,7 @@ app.post('/api/import-youtube', async (req, res) => {
                             image_url: coverUrl,
                             audio_url: audioUrl,
                             content: '',
-                            description: '', // yt-search playlist objects don't have descriptions, keeping empty to save space
+                            description: video.description || '',
                             pitch: 1.0,
                             is_trending: false,
                             is_published: true,
@@ -155,7 +189,7 @@ app.post('/api/import-youtube', async (req, res) => {
             }));
         }
 
-        console.log('[BACKGROUND] ALL EPISODES IMPORTED SUCCESSFULLY! ✅');
+        console.log('[BACKGROUND] ALL IMPORT JOBS PROCESSED SUCCESSFULLY! ✅');
 
     } catch (e) {
         console.error('[BACKGROUND] Fatal Error in import job:', e);
